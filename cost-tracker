@@ -1,0 +1,324 @@
+#!/bin/bash
+# Cost Tracker - Track LLM API costs across providers
+# https://github.com/tommieseals/cost-tracker
+
+set -e
+
+VERSION="1.0.0"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/cost-tracker"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/cost-tracker"
+COSTS_FILE="$DATA_DIR/costs.json"
+
+# Budget thresholds
+ALERT_THRESHOLD_DAILY="${ALERT_THRESHOLD_DAILY:-5.00}"
+ALERT_THRESHOLD_WEEKLY="${ALERT_THRESHOLD_WEEKLY:-25.00}"
+ALERT_THRESHOLD_MONTHLY="${ALERT_THRESHOLD_MONTHLY:-100.00}"
+
+# External data sources
+TOKEN_LOG="${TOKEN_LOG:-$HOME/logs/token-usage.log}"
+METRICS_DIR="${METRICS_DIR:-$HOME/dta/metrics}"
+DTA_METRICS="$METRICS_DIR/daily-usage.json"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+TODAY=$(date +%Y-%m-%d)
+TIMESTAMP=$(date -Iseconds 2>/dev/null || date +%Y-%m-%dT%H:%M:%S)
+
+mkdir -p "$DATA_DIR" "$CONFIG_DIR"
+
+init_costs_file() {
+    [ ! -f "$COSTS_FILE" ] && echo "[]" > "$COSTS_FILE"
+}
+
+# Get Ollama (local) usage
+get_ollama_usage() {
+    local calls=0 input_tokens=0 output_tokens=0
+    
+    if [ -f "$TOKEN_LOG" ]; then
+        while IFS='|' read -r ts agent model ip op total cost; do
+            local log_date=$(echo "$ts" | cut -dT -f1)
+            if [ "$log_date" = "$TODAY" ] && [ "$model" = "local" ]; then
+                input_tokens=$((input_tokens + ${ip:-0}))
+                output_tokens=$((output_tokens + ${op:-0}))
+                calls=$((calls + 1))
+            fi
+        done < "$TOKEN_LOG"
+    fi
+    
+    echo "${calls}|${input_tokens}|${output_tokens}"
+}
+
+# Get NVIDIA NIM usage
+get_nvidia_usage() {
+    local calls=0
+    
+    if [ -f "$DTA_METRICS" ]; then
+        local metric_date=$(jq -r '.date // empty' "$DTA_METRICS" 2>/dev/null)
+        if [ "$metric_date" = "$TODAY" ]; then
+            local kimi=$(jq -r '.kimi_calls // 0' "$DTA_METRICS")
+            local other=$(jq -r '.nvidia_calls // 0' "$DTA_METRICS")
+            calls=$((${kimi:-0} + ${other:-0}))
+        fi
+    fi
+    
+    echo "$calls"
+}
+
+# Get OpenRouter usage
+get_openrouter_usage() {
+    local calls=0 cost=0
+    
+    if [ -f "$DTA_METRICS" ]; then
+        local metric_date=$(jq -r '.date // empty' "$DTA_METRICS" 2>/dev/null)
+        if [ "$metric_date" = "$TODAY" ]; then
+            calls=$(jq -r '.openrouter_calls // 0' "$DTA_METRICS")
+            cost=$(jq -r '.openrouter_cost // 0' "$DTA_METRICS")
+        fi
+    fi
+    
+    echo "${calls}|${cost}"
+}
+
+# Get Perplexity usage
+get_perplexity_usage() {
+    local calls=0 cost=0
+    
+    if [ -f "$DTA_METRICS" ]; then
+        local metric_date=$(jq -r '.date // empty' "$DTA_METRICS" 2>/dev/null)
+        if [ "$metric_date" = "$TODAY" ]; then
+            calls=$(jq -r '.perplexity_calls // 0' "$DTA_METRICS")
+            cost=$(jq -r '.perplexity_cost // 0' "$DTA_METRICS")
+        fi
+    fi
+    
+    echo "${calls}|${cost}"
+}
+
+# Estimate Claude usage from memory files
+estimate_claude_usage() {
+    local sessions=0 tokens=0
+    local memory_file="$HOME/clawd/memory/$TODAY.md"
+    
+    if [ -f "$memory_file" ]; then
+        sessions=$(grep -c "^##" "$memory_file" 2>/dev/null || echo 0)
+        tokens=$((sessions * 2000))  # Rough estimate
+    fi
+    
+    echo "${sessions}|${tokens}"
+}
+
+track_costs() {
+    init_costs_file
+    
+    # Gather data
+    IFS='|' read -r ollama_calls ollama_in ollama_out <<< "$(get_ollama_usage)"
+    nvidia_calls=$(get_nvidia_usage)
+    IFS='|' read -r or_calls or_cost <<< "$(get_openrouter_usage)"
+    IFS='|' read -r px_calls px_cost <<< "$(get_perplexity_usage)"
+    IFS='|' read -r claude_sessions claude_tokens <<< "$(estimate_claude_usage)"
+    
+    # Calculate Claude cost estimate
+    claude_cost=$(echo "${claude_tokens:-0} * 0.0000105" | bc -l 2>/dev/null || echo 0)
+    
+    # Total cost
+    total_cost=$(echo "${or_cost:-0} + ${px_cost:-0} + ${claude_cost:-0}" | bc -l 2>/dev/null || echo "${or_cost:-0}")
+    
+    # Build entry
+    local entry=$(cat << EOF
+{
+  "date": "$TODAY",
+  "timestamp": "$TIMESTAMP",
+  "ollama": {
+    "calls": ${ollama_calls:-0},
+    "input_tokens": ${ollama_in:-0},
+    "output_tokens": ${ollama_out:-0},
+    "cost": 0
+  },
+  "nvidia": {
+    "calls": ${nvidia_calls:-0},
+    "limit": 50,
+    "cost": 0
+  },
+  "openrouter": {
+    "calls": ${or_calls:-0},
+    "cost": ${or_cost:-0}
+  },
+  "perplexity": {
+    "calls": ${px_calls:-0},
+    "cost": ${px_cost:-0}
+  },
+  "claude_estimate": {
+    "sessions": ${claude_sessions:-0},
+    "tokens_approx": ${claude_tokens:-0},
+    "cost_approx": ${claude_cost:-0}
+  },
+  "daily_total": ${total_cost:-0}
+}
+EOF
+)
+    
+    # Update or append
+    local exists=$(jq "map(select(.date == \"$TODAY\")) | length" "$COSTS_FILE")
+    if [ "$exists" -gt 0 ]; then
+        jq "map(if .date == \"$TODAY\" then $entry else . end)" "$COSTS_FILE" > "${COSTS_FILE}.tmp"
+    else
+        jq ". + [$entry]" "$COSTS_FILE" > "${COSTS_FILE}.tmp"
+    fi
+    mv "${COSTS_FILE}.tmp" "$COSTS_FILE"
+    
+    # Keep last 90 days
+    jq '. | sort_by(.date) | .[-90:]' "$COSTS_FILE" > "${COSTS_FILE}.tmp"
+    mv "${COSTS_FILE}.tmp" "$COSTS_FILE"
+    
+    echo "$entry"
+}
+
+check_alerts() {
+    init_costs_file
+    
+    local today_cost=$(jq -r "map(select(.date == \"$TODAY\")) | .[0].daily_total // 0" "$COSTS_FILE")
+    
+    # Weekly total
+    local week_ago=$(date -v-7d +%Y-%m-%d 2>/dev/null || date -d "7 days ago" +%Y-%m-%d 2>/dev/null || echo "")
+    local week_cost=0
+    if [ -n "$week_ago" ]; then
+        week_cost=$(jq -r "[.[] | select(.date >= \"$week_ago\") | .daily_total] | add // 0" "$COSTS_FILE")
+    fi
+    
+    # Monthly total
+    local month_ago=$(date -v-30d +%Y-%m-%d 2>/dev/null || date -d "30 days ago" +%Y-%m-%d 2>/dev/null || echo "")
+    local month_cost=0
+    if [ -n "$month_ago" ]; then
+        month_cost=$(jq -r "[.[] | select(.date >= \"$month_ago\") | .daily_total] | add // 0" "$COSTS_FILE")
+    fi
+    
+    local alerts=0
+    
+    if [ $(echo "$today_cost > $ALERT_THRESHOLD_DAILY" | bc -l 2>/dev/null || echo 0) -eq 1 ]; then
+        echo -e "${RED}ALERT: Daily cost \$${today_cost} exceeds \$${ALERT_THRESHOLD_DAILY}${NC}"
+        alerts=1
+    fi
+    
+    if [ $(echo "$week_cost > $ALERT_THRESHOLD_WEEKLY" | bc -l 2>/dev/null || echo 0) -eq 1 ]; then
+        echo -e "${RED}ALERT: Weekly cost \$${week_cost} exceeds \$${ALERT_THRESHOLD_WEEKLY}${NC}"
+        alerts=1
+    fi
+    
+    if [ $(echo "$month_cost > $ALERT_THRESHOLD_MONTHLY" | bc -l 2>/dev/null || echo 0) -eq 1 ]; then
+        echo -e "${RED}ALERT: Monthly cost \$${month_cost} exceeds \$${ALERT_THRESHOLD_MONTHLY}${NC}"
+        alerts=1
+    fi
+    
+    [ $alerts -eq 0 ] && echo -e "${GREEN}All costs within budget${NC}"
+}
+
+show_summary() {
+    init_costs_file
+    
+    echo ""
+    echo -e "${CYAN}Cost and Token Tracker${NC}"
+    echo "========================"
+    
+    local data=$(jq -r "map(select(.date == \"$TODAY\")) | .[0]" "$COSTS_FILE")
+    
+    if [ "$data" = "null" ] || [ -z "$data" ]; then
+        echo "No data for today. Run: cost-tracker --track"
+        return
+    fi
+    
+    echo -e "${GREEN}Date: $TODAY${NC}"
+    echo ""
+    echo "FREE TIER:"
+    echo "  Ollama:  $(echo "$data" | jq -r '.ollama.calls') calls"
+    echo "  NVIDIA:  $(echo "$data" | jq -r '.nvidia.calls')/$(echo "$data" | jq -r '.nvidia.limit') daily calls"
+    echo ""
+    echo "PAID:"
+    echo "  OpenRouter: $(echo "$data" | jq -r '.openrouter.calls') calls (\$$(echo "$data" | jq -r '.openrouter.cost'))"
+    echo "  Perplexity: $(echo "$data" | jq -r '.perplexity.calls') calls (\$$(echo "$data" | jq -r '.perplexity.cost'))"
+    echo "  Claude:     $(echo "$data" | jq -r '.claude_estimate.sessions') sessions (~\$$(printf '%.3f' $(echo "$data" | jq -r '.claude_estimate.cost_approx')))"
+    echo ""
+    echo -e "TOTAL TODAY: ${CYAN}\$$(printf '%.3f' $(echo "$data" | jq -r '.daily_total'))${NC}"
+    echo ""
+    
+    check_alerts || true
+}
+
+export_data() {
+    local format="${1:-json}"
+    init_costs_file
+    
+    case "$format" in
+        json)
+            cat "$COSTS_FILE"
+            ;;
+        csv)
+            echo "date,ollama_calls,nvidia_calls,openrouter_calls,openrouter_cost,perplexity_calls,perplexity_cost,claude_sessions,daily_total"
+            jq -r '.[] | [.date, .ollama.calls, .nvidia.calls, .openrouter.calls, .openrouter.cost, .perplexity.calls, .perplexity.cost, .claude_estimate.sessions, .daily_total] | @csv' "$COSTS_FILE"
+            ;;
+        *)
+            echo "Unknown format: $format (use json or csv)"
+            exit 1
+            ;;
+    esac
+}
+
+show_chart() {
+    local period="${1:-week}"
+    init_costs_file
+    
+    echo ""
+    echo "Daily Costs (Last 7 Days)"
+    echo ""
+    
+    local max_cost=$(jq '[.[-7:][].daily_total] | max // 0.01' "$COSTS_FILE")
+    
+    jq -r '.[-7:][] | "\(.date)|\(.daily_total)"' "$COSTS_FILE" | while IFS='|' read -r date cost; do
+        local bar_len=$(echo "scale=0; ($cost / $max_cost) * 40" | bc -l 2>/dev/null || echo 0)
+        local bar=$(printf '%*s' "${bar_len:-0}" '' | tr ' ' '*')
+        printf "%s | %s \$%.3f\n" "${date:5}" "$bar" "$cost"
+    done
+}
+
+usage() {
+    cat << EOF
+cost-tracker $VERSION - Track LLM API costs
+
+Usage: cost-tracker [OPTIONS]
+
+Options:
+  -t, --track       Track current usage
+  -s, --summary     Show cost summary (default)
+  -a, --alerts      Check budget alerts
+  -e, --export FMT  Export data (json or csv)
+  -c, --chart       Show ASCII cost chart
+  -j, --json        Output raw JSON data
+  -v, --version     Show version
+  -h, --help        Show this help
+
+Examples:
+  cost-tracker --track           # Record today's usage
+  cost-tracker --summary         # Show summary
+  cost-tracker --export csv      # Export to CSV
+  cost-tracker --alerts          # Check budget alerts
+EOF
+}
+
+# Main
+case "${1:-}" in
+    -t|--track)     track_costs > /dev/null; echo -e "${GREEN}Tracked for $TODAY${NC}" ;;
+    -s|--summary)   show_summary ;;
+    -a|--alerts)    check_alerts ;;
+    -e|--export)    export_data "$2" ;;
+    -c|--chart)     show_chart "$2" ;;
+    -j|--json)      cat "$COSTS_FILE" ;;
+    -v|--version)   echo "cost-tracker $VERSION" ;;
+    -h|--help)      usage ;;
+    "")             track_costs > /dev/null; show_summary ;;
+    *)              echo "Unknown option: $1"; usage; exit 1 ;;
+esac
+
