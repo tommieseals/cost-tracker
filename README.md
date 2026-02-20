@@ -1,4 +1,4 @@
-# ???? Cost Tracker
+# 💰 Cost Tracker
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Bash](https://img.shields.io/badge/bash-5.0+-green.svg)](https://www.gnu.org/software/bash/)
@@ -69,7 +69,7 @@ cost-tracker --alerts
 
 ## Configuration
 
-Set environment variables or create ~/.config/cost-tracker/config:
+Set environment variables or create `~/.config/cost-tracker/config`:
 
 ```bash
 # Budget thresholds
@@ -135,4 +135,3 @@ Add to crontab for automatic tracking:
 ## License
 
 MIT License - see LICENSE
-
